@@ -1,6 +1,6 @@
-ship = Luna-16 Mun Carrier V3 Fixed 3
+ship = Luna-16 Mun Final
 version = 1.12.5
-description = V3 Fixed 3: four protruding Oscar-B tanks merged into their inboard tanks, clearing the Poodle separation plane.
+description = Final mission version: verified ascent, Mun transfer, landing, ascent from the Mun, Kerbin return and passive parachute recovery.
 type = VAB
 size = 7.98274899,30.3965197,5
 steamPublishedFileId = 0

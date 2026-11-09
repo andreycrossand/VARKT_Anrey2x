@@ -28,6 +28,7 @@ import krpc
 # ------------------------------ Настройки ---------------------------------
 
 EXPECTED_VESSEL_NAMES = (
+    "Luna-16 Mun Final",
     "Luna-16 Mun Carrier V2 Fixed",
     "Luna-16 Mun Carrier V3",
     "Luna-16 Mun Carrier V3 Mission Plus",

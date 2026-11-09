@@ -1,1 +1,0 @@
-mission_time_s,altitude_m,speed_m_s,vertical_speed_m_s,horizontal_speed_m_s,pitch_deg,heading_deg,target_pitch_deg,apoapsis_altitude_m,periapsis_altitude_m,dynamic_pressure_pa,mass_t,thrust_n,throttle,current_stage

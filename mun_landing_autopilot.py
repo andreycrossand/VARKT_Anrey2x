@@ -19,8 +19,8 @@ import krpc
 
 MIN_ORBIT_ALTITUDE = 15_000.0
 MAX_ORBIT_ALTITUDE = 120_000.0
-MIN_SUN_ELEVATION = 20.0
-MAX_TERRAIN_VARIATION = 35.0
+MIN_SUN_ELEVATION = 35.0
+PREFERRED_TERRAIN_VARIATION = 35.0
 SITE_SAMPLE_RADIUS_DEG = 0.35
 SITE_SEARCH_STEP = 30.0
 SITE_LEAD_TIME = 180.0
@@ -161,27 +161,32 @@ def find_landing_site(conn, vessel):
         illumination = sun_elevation(conn, body, latitude, longitude)
         if illumination >= MIN_SUN_ELEVATION:
             variation = terrain_variation(body, latitude, longitude)
-            if variation <= MAX_TERRAIN_VARIATION:
-                # Сначала выбираем самый ровный участок. Освещённость служит
-                # только вторичным критерием между площадками сходной ровности.
-                candidate = (
-                    variation,
-                    -illumination,
-                    candidate_ut,
-                    latitude,
-                    longitude,
-                    illumination,
-                )
-                if best is None or candidate < best:
-                    best = candidate
+            # Ровность — главный критерий. Жёстко отбрасывать площадки нельзя:
+            # на некоторых трассах Муны идеального участка просто нет.
+            candidate = (
+                variation,
+                -illumination,
+                candidate_ut,
+                latitude,
+                longitude,
+                illumination,
+            )
+            if best is None or candidate < best:
+                best = candidate
         candidate_ut += SITE_SEARCH_STEP
 
     if best is None:
         raise RuntimeError(
-            "На текущем витке не найден достаточно светлый и ровный участок. "
+            "На доступной трассе не найден ни один освещённый участок. "
             "Попробуйте запустить скрипт через один виток."
         )
     variation, _, site_ut, latitude, longitude, illumination = best
+    if variation > PREFERRED_TERRAIN_VARIATION:
+        print(
+            f"Предупреждение: участка с перепадом до "
+            f"{PREFERRED_TERRAIN_VARIATION:.0f} м на трассе нет; "
+            f"выбран самый ровный доступный ({variation:.0f} м)."
+        )
     return site_ut, latitude, longitude, illumination, variation
 
 
