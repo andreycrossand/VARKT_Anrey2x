@@ -29,9 +29,12 @@ MIN_LANDING_TWR = 1.25
 HORIZONTAL_BRAKE_TARGET = 12.0
 TOUCHDOWN_ALTITUDE = 4.0
 TOUCHDOWN_SPEED = 1.5
-ALIGNMENT_TIMEOUT = 45.0
+ALIGNMENT_TIMEOUT = 75.0
 DESCENT_BURN_MARGIN = 1.30
 DESCENT_BURN_BUFFER = 250.0
+POODLE_SEPARATION_FORCE_PERCENT = 20.0
+POODLE_CLEARANCE_DISTANCE = 5.0
+POODLE_CLEARANCE_TIMEOUT = 8.0
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -202,10 +205,13 @@ def wait_for_alignment(vessel, autopilot) -> None:
         charge, _ = electric_charge(vessel)
         if charge < MIN_ELECTRIC_CHARGE:
             raise RuntimeError("Недостаточно электричества для наведения.")
-        if autopilot.error <= 3.0:
+        if autopilot.error <= 5.0:
             return
         time.sleep(0.1)
-    raise RuntimeError("Аппарат не успел развернуться к направлению торможения.")
+    raise RuntimeError(
+        "Аппарат не успел развернуться к направлению торможения "
+        f"за {ALIGNMENT_TIMEOUT:.0f} с."
+    )
 
 
 def brake_with_poodle(vessel, autopilot, frame) -> None:
@@ -250,11 +256,179 @@ def brake_with_poodle(vessel, autopilot, frame) -> None:
         time.sleep(0.05)
 
     control.throttle = 0.0
+    # Перед разделением гарантированно глушим двигатель. Иначе остаточная тяга
+    # и работа автопилота могут впечатать Poodle в посадочный аппарат.
+    engine.active = False
     _, horizontal_speed = point_opposite_velocity(vessel, autopilot, frame)
     print(
         f"Работа Poodle завершена; горизонтальная скорость "
         f"{horizontal_speed:.1f} м/с."
     )
+
+
+def wait_for_lander(space_center, timeout: float = 10.0):
+    """Ждёт именно отделившийся модуль, а не старую составную связку."""
+    deadline = time.monotonic() + timeout
+    stable_reads = 0
+    candidate = None
+    while time.monotonic() < deadline:
+        try:
+            candidate = space_center.active_vessel
+            if candidate is None:
+                stable_reads = 0
+                time.sleep(0.1)
+                continue
+            landing_engines = engines_with_name(candidate, "smallRadialEngine")
+            poodle_engines = engines_with_name(candidate, "liquidEngine2-2")
+            _ = candidate.mass
+            # До завершения физического кадра KSP active_vessel уже доступен,
+            # но всё ещё может содержать Poodle. Такой объект принимать нельзя.
+            if len(landing_engines) == 8 and not poodle_engines:
+                stable_reads += 1
+                if stable_reads >= 5:
+                    return candidate
+            else:
+                stable_reads = 0
+        except Exception as error:
+            if error.__class__.__name__ != "ObjectNotLoadedException":
+                raise
+            stable_reads = 0
+        time.sleep(0.1)
+    raise RuntimeError(
+        "После отделения Poodle не удалось устойчиво выбрать посадочный модуль."
+    )
+
+
+def reduce_separator_force(separator) -> None:
+    """Уменьшает резкий толчок разделителя перед отделением тяжёлого модуля."""
+    try:
+        module = next(
+            item
+            for item in separator.part.modules
+            if item.name == "ModuleDecouple"
+        )
+        field = next(
+            item
+            for item in module.field_list
+            if item.name == "ejectionForcePercent"
+        )
+        field.float_value = POODLE_SEPARATION_FORCE_PERCENT
+        print(
+            f"Сила разделителя Poodle снижена до "
+            f"{POODLE_SEPARATION_FORCE_PERCENT:.0f}%."
+        )
+    except (RuntimeError, StopIteration):
+        # В старых версиях kRPC это внутреннее поле может быть недоступно.
+        # Fixed 2 содержит такое же ограничение непосредственно в craft-файле.
+        print(
+            "Предупреждение: kRPC не позволил изменить силу разделителя; "
+            "использую штатное значение конструкции."
+        )
+
+
+def wait_for_poodle_clearance(lander, poodle_stage, frame) -> None:
+    """Не разрешает полное торможение, пока ступень Poodle находится рядом."""
+    if poodle_stage is None:
+        time.sleep(1.0)
+        return
+
+    deadline = time.monotonic() + POODLE_CLEARANCE_TIMEOUT
+    last_distance = 0.0
+    while time.monotonic() < deadline:
+        try:
+            separation = vector_subtract(
+                lander.position(frame),
+                poodle_stage.position(frame),
+            )
+            last_distance = vector_length(separation)
+            if last_distance >= POODLE_CLEARANCE_DISTANCE:
+                print(f"Расстояние до ступени Poodle: {last_distance:.1f} м.")
+                return
+        except RuntimeError:
+            # Ступень уже вышла из физического диапазона или была уничтожена.
+            return
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"Ступень Poodle не отошла на безопасные "
+        f"{POODLE_CLEARANCE_DISTANCE:.0f} м; расстояние {last_distance:.1f} м."
+    )
+
+
+def safely_separate_poodle(space_center, vessel, separator):
+    """Гасит тягу и мягко отводит посадочный аппарат от ступени Poodle."""
+    control = vessel.control
+    autopilot = vessel.auto_pilot
+    control.throttle = 0.0
+    control.sas = False
+    control.rcs = False
+
+    # Сохраняем точное ретроградное положение всей связки до отделения. Смена
+    # kRPC-autopilot на SAS в этот момент раньше давала короткий рывок по крену.
+    frame = vessel.orbit.body.reference_frame
+    autopilot.reference_frame = frame
+    point_opposite_velocity(vessel, autopilot, frame)
+    autopilot.engaged = True
+    wait_for_alignment(vessel, autopilot)
+
+    # Дожидаемся двух спокойных физических кадров с нулевой тягой.
+    quiet_samples = 0
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and quiet_samples < 2:
+        if vessel.thrust < 1.0:
+            quiet_samples += 1
+        else:
+            quiet_samples = 0
+        time.sleep(0.1)
+    if quiet_samples < 2:
+        raise RuntimeError("Poodle не успел полностью погасить тягу перед отделением.")
+
+    reduce_separator_force(separator)
+    detached_vessel = separator.decouple()
+    vessel = wait_for_lander(space_center)
+    control = vessel.control
+    control.throttle = 0.0
+    control.sas = False
+
+    if engines_with_name(vessel, "liquidEngine2-2"):
+        raise RuntimeError(
+            "После команды отделения Poodle всё ещё принадлежит посадочному "
+            "модулю. Включение посадочных двигателей запрещено."
+        )
+
+    # Сразу возвращаем ретроградное наведение новому объекту, но держим тягу
+    # закрытой до окончания разворота. Так двигатели не расходуют delta-v боком.
+    autopilot = vessel.auto_pilot
+    autopilot.reference_frame = frame
+    point_opposite_velocity(vessel, autopilot, frame)
+    control.rcs = bool(vessel.parts.rcs)
+    autopilot.engaged = True
+    wait_for_alignment(vessel, autopilot)
+
+    poodle_stage = None
+    try:
+        if engines_with_name(detached_vessel, "liquidEngine2-2"):
+            poodle_stage = detached_vessel
+    except RuntimeError:
+        pass
+    if poodle_stage is None:
+        for candidate in space_center.vessels:
+            try:
+                if engines_with_name(candidate, "liquidEngine2-2"):
+                    poodle_stage = candidate
+                    break
+            except RuntimeError:
+                continue
+
+    # После выравнивания даём около 1 м/с осевого отхода. Это несравнимо
+    # дешевле, чем терять десятки м/с на торможении раскрученного аппарата.
+    landing_engines = activate_landing_engines(vessel)
+    control.throttle = 0.15
+    time.sleep(0.60)
+    control.throttle = 0.0
+    wait_for_poodle_clearance(vessel, poodle_stage, frame)
+    control.rcs = False
+    print("Отделение Poodle подтверждено; ступени безопасно разошлись.")
+    return vessel
 
 
 def landing_direction(vessel, frame, horizontal_speed: float):
@@ -405,9 +579,7 @@ def run() -> None:
     brake_with_poodle(vessel, autopilot, frame)
 
     separator = find_poodle_separator(vessel)
-    separator.decouple()
-    time.sleep(1.5)
-    vessel = space_center.active_vessel
+    vessel = safely_separate_poodle(space_center, vessel, separator)
     control = vessel.control
     autopilot = vessel.auto_pilot
 
@@ -427,8 +599,13 @@ def run() -> None:
 
     autopilot.reference_frame = frame
     point_opposite_velocity(vessel, autopilot, frame)
+    # Stability Assist, оставшийся после разделения, может бороться с kRPC и
+    # удерживать прежнее положение. Наведение выполняет только автопилот.
+    control.sas = False
+    control.rcs = bool(vessel.parts.rcs)
     autopilot.engaged = True
     wait_for_alignment(vessel, autopilot)
+    control.rcs = False
     print("Начинаю гашение орбитальной скорости.")
 
     zero_thrust_since = None

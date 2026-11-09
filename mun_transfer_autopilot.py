@@ -29,7 +29,6 @@ MUN_PERIAPSIS_TOLERANCE = 5_000.0
 CORRECTION_LEAD_TIME = 180.0
 MANEUVER_LEAD_TIME = 180.0
 CAPTURE_RESERVE_DELTA_V = 350.0
-LANDING_RESERVE_DELTA_V = 550.0
 FUEL_UNIT_MASS_KG = 5.0
 MIN_CONTROL_ELECTRIC_CHARGE = 25.0
 MIN_SOLAR_FLOW = 0.01
@@ -91,7 +90,10 @@ def upper_stage_fuel(vessel) -> tuple[float, float]:
     """Return only propellant feeding Poodle, excluding lander reserves."""
     liquid_fuel = 0.0
     oxidizer = 0.0
-    tank_names = {"Rockomax8BW", "Rockomax16.BW", "fuelTankSmallFlat"}
+    # На Landing Heavy четыре FL-T100 принадлежат посадочному модулю.
+    # В запас Poodle включаем только его собственные большие баки; небольшой
+    # неучтённый запас в Oscar-B делает эту проверку консервативной.
+    tank_names = {"Rockomax8BW", "Rockomax16.BW"}
     for part in vessel.parts.all:
         if part.name not in tank_names:
             continue
@@ -306,38 +308,33 @@ def orient_solar_panels(conn, vessel) -> None:
         time.sleep(1.0)
         flow = solar_flow(vessel)
         exposure = solar_exposure(vessel)
-        if flow >= MIN_SOLAR_FLOW or exposure > 0.05:
-            charge_before, maximum = electric_charge(vessel)
-            time.sleep(SOLAR_TEST_DURATION)
-            charge_after, _ = electric_charge(vessel)
-            drain = max(
-                0.0,
-                (charge_before - charge_after) / SOLAR_TEST_DURATION,
-            )
-            if drain < lowest_drain:
-                lowest_drain = drain
-                best_candidate = (direction, target_roll, description)
-            # На полном аккумуляторе KSP иногда возвращает energy_flow=0,
-            # хотя панели освещены и покрывают текущую нагрузку. Поэтому
-            # окончательное решение принимаем по реальному изменению заряда.
-            if drain > 0.03:
-                continue
-            print(
-                f"Солнечная зарядка подтверждена ({description} к Солнцу): "
-                f"освещённость {exposure:.2f}, поток {flow:.3f} EC/с; "
-                f"аккумулятор {charge_after:.1f}/{maximum:.1f}."
-            )
-            return
+        charge_before, maximum = electric_charge(vessel)
+        time.sleep(SOLAR_TEST_DURATION)
+        charge_after, _ = electric_charge(vessel)
+        drain = max(
+            0.0,
+            (charge_before - charge_after) / SOLAR_TEST_DURATION,
+        )
+        if drain < lowest_drain:
+            lowest_drain = drain
+            best_candidate = (direction, target_roll, description)
+
+        # kRPC/KSP иногда возвращает одновременно energy_flow=0 и
+        # sun_exposure=0 после варпа, даже когда энергетический баланс
+        # положительный. Поэтому решающим считаем фактический заряд: если при
+        # выключенных SAS и автопилоте он не убывает, перелёт безопасен.
+        if drain > 0.03:
+            continue
+        print(
+            f"Энергетический баланс подтверждён ({description} к Солнцу): "
+            f"освещённость {exposure:.2f}, поток {flow:.3f} EC/с, "
+            f"изменение заряда {-drain:.3f} EC/с; "
+            f"аккумулятор {charge_after:.1f}/{maximum:.1f}."
+        )
+        return
 
     autopilot.engaged = False
     control.sas = False
-    exposure = solar_exposure(vessel)
-    if exposure <= 0.0:
-        raise RuntimeError(
-            "Панели не видят Солнце ни в одном положении. "
-            "Вероятно, их рабочая сторона закрыта соседними деталями."
-        )
-
     # Даже при слабой генерации аппарат может безопасно долететь на запасе
     # аккумулятора. Оставляем его в положении с минимальным измеренным расходом
     # только если расчётного заряда хватает до сферы влияния Муны с запасом.
@@ -361,9 +358,11 @@ def orient_solar_panels(conn, vessel) -> None:
                 f"достаточен до Муны по текущей оценке."
             )
             return
+    exposure = solar_exposure(vessel)
     raise RuntimeError(
-        "Панели освещены, но пассивный расход превышает генерацию, а заряда "
-        "недостаточно до Муны. Нужно переставить или добавить солнечные панели."
+        "Ни одно положение не обеспечивает безопасный энергетический баланс: "
+        f"максимальная освещённость {exposure:.2f}, минимальный пассивный "
+        f"расход {lowest_drain:.3f} EC/с. Заряда недостаточно до Муны."
     )
 
 
@@ -644,6 +643,7 @@ def plan_transfer_node(conn, vessel, mun):
 def enter_mun_soi(conn, vessel, mun) -> None:
     # Во время перелёта раз в полтора игровых часа проверяем аккумулятор и
     # состояние панелей. Последний короткий участок обрабатывается отдельно.
+    solar_sensor_warning_shown = False
     for _ in range(100):
         if vessel.orbit.body.name == mun.name:
             return
@@ -657,9 +657,16 @@ def enter_mun_soi(conn, vessel, mun) -> None:
             and flow < MIN_SOLAR_FLOW
             and exposure <= 0.05
         ):
-            raise RuntimeError(
-                "Корабль освещён, но панели не видят Солнце. Ускорение отменено."
-            )
+            # После физического варпа KSP/kRPC иногда одновременно сообщает
+            # нулевые energy_flow и sun_exposure даже у работающих панелей.
+            # Перед перелётом их энергетический баланс уже проверен по
+            # фактическому изменению заряда, поэтому здесь доверяем батарее.
+            if not solar_sensor_warning_shown:
+                print(
+                    "Предупреждение: датчики панелей показывают ноль; "
+                    "продолжаю контроль по фактическому заряду аккумулятора."
+                )
+                solar_sensor_warning_shown = True
         time_to_change = vessel.orbit.time_to_soi_change
         if not math.isfinite(time_to_change) or time_to_change <= 0.0:
             raise RuntimeError("После разгона не найден вход в сферу влияния Муны.")
@@ -865,21 +872,14 @@ def run() -> None:
             transfer_node, predicted_periapsis = plan_transfer_node(
                 conn, vessel, mun
             )
-            required_delta_v = (
-                transfer_node.delta_v
-                + CAPTURE_RESERVE_DELTA_V
-                + LANDING_RESERVE_DELTA_V
-            )
+            required_delta_v = transfer_node.delta_v + CAPTURE_RESERVE_DELTA_V
             if available_upper_delta_v < required_delta_v:
                 transfer_node.remove()
                 conn.close()
                 raise RuntimeError(
                     f"Топлива Poodle недостаточно: доступно около "
                     f"{available_upper_delta_v:.0f} м/с, требуется не менее "
-                    f"{required_delta_v:.0f} м/с с резервом на захват Муны "
-                    f"({CAPTURE_RESERVE_DELTA_V:.0f} м/с) и помощь при посадке "
-                    f"({LANDING_RESERVE_DELTA_V:.0f} м/с). Добавьте бак "
-                    "X200-8 к ступени Poodle."
+                    f"{required_delta_v:.0f} м/с с резервом на захват Муны."
                 )
             wait_time = transfer_node.ut - space_center.ut
             print(

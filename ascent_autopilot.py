@@ -30,6 +30,12 @@ import krpc
 EXPECTED_VESSEL_NAMES = (
     "Luna-16 Mun Carrier V2 Fixed",
     "Luna-16 Mun Carrier V3",
+    "Luna-16 Mun Carrier V3 Mission Plus",
+    "Luna-16 Mun Carrier V3 Landing Heavy",
+    "Luna-16 Mun Carrier V3 Mission Heavy",
+    "Luna-16 Mun Carrier V3 Fixed 1",
+    "Luna-16 Mun Carrier V3 Fixed 2",
+    "Luna-16 Mun Carrier V3 Fixed 3",
 )
 
 TARGET_ORBIT_ALTITUDE = 100_000.0       # круговая орбита 100 км
@@ -40,8 +46,10 @@ BOOSTER_SEPARATION_FUEL = 1.0            # остаток SolidFuel, ед.
 MAX_DYNAMIC_PRESSURE = 30_000.0          # ограничитель Max-Q, Па
 MIN_THROTTLE_IN_ATMOSPHERE = 0.45
 TELEMETRY_PERIOD = 0.20                  # 5 измерений в секунду
-UPPER_STAGE_SEPARATION_DELAY = 2.5       # время на отход центральной ступени
-UPPER_STAGE_IGNITION_RAMP = 2.0          # плавный набор тяги Poodle
+UPPER_STAGE_SEPARATION_DELAY = 0.2       # минимальная пауза на отход ступени
+UPPER_STAGE_IGNITION_RAMP = 0.25         # почти мгновенный набор тяги Poodle
+MIN_SAFE_UPPER_STAGE_ALTITUDE = 76_000.0
+MAX_SAFE_DESCENT_SPEED = -40.0
 
 G0 = 9.80665
 
@@ -140,8 +148,10 @@ def validate_vehicle(vessel):
             f"Предупреждение: внутреннее имя корабля — '{vessel.name}'. "
             "Проверяю конструкцию по двигателям."
         )
-    if len(boosters) != 2:
-        errors.append(f"найдено ТТУ: {len(boosters)}, ожидалось: 2")
+    if len(boosters) not in {2, 4}:
+        errors.append(
+            f"найдено ТТУ: {len(boosters)}, ожидалось: 2 или 4"
+        )
     if len(core_engines) != 1:
         errors.append(
             f"центральных Mainsail найдено: {len(core_engines)}, ожидался: 1"
@@ -200,6 +210,37 @@ def jettison_fairing(vessel, state: FlightState) -> None:
     print("Обтекатель сброшен вместе с центральной ступенью.")
 
 
+def wait_for_active_vessel(conn, timeout: float = 15.0):
+    """Пережидает короткое состояние загрузки KSP после разделения ступени."""
+    deadline = time.monotonic() + timeout
+    last_error = None
+    stable_reads = 0
+    candidate = None
+    while time.monotonic() < deadline:
+        try:
+            candidate = conn.space_center.active_vessel
+            if candidate is None:
+                stable_reads = 0
+                time.sleep(0.1)
+                continue
+            # Простого получения active_vessel недостаточно: во время смены
+            # состояния RPC-объект уже существует, но его Orbit ещё не загружен.
+            _ = candidate.orbit.apoapsis_altitude
+            _ = candidate.mass
+            stable_reads += 1
+            if stable_reads >= 3:
+                return candidate
+        except Exception as error:
+            if error.__class__.__name__ != "ObjectNotLoadedException":
+                raise
+            last_error = error
+            stable_reads = 0
+        time.sleep(0.15)
+    raise RuntimeError(
+        "KSP не завершил переключение на новую ступень за 15 секунд."
+    ) from last_error
+
+
 def activate_upper_stage(conn, vessel, state: FlightState):
     """Отделяет пустой центральный блок и запускает Poodle.
 
@@ -218,7 +259,7 @@ def activate_upper_stage(conn, vessel, state: FlightState):
         time.sleep(0.8)
         # После срабатывания разделителя активный объект может получить новый
         # RPC-идентификатор, поэтому обязательно запрашиваем его заново.
-        vessel = conn.space_center.active_vessel
+        vessel = wait_for_active_vessel(conn)
         upper_engines = engines_with_name(vessel, "liquidEngine2-2")
         if any(engine.active and engine.has_fuel for engine in upper_engines):
             # Обтекатель снимаем адресно сразу после разделения. Он больше не
@@ -233,7 +274,7 @@ def activate_upper_stage(conn, vessel, state: FlightState):
             time.sleep(UPPER_STAGE_SEPARATION_DELAY)
 
             # После разделения повторно получаем активный объект и двигатель.
-            vessel = conn.space_center.active_vessel
+            vessel = wait_for_active_vessel(conn)
             upper_engines = engines_with_name(vessel, "liquidEngine2-2")
             fueled_engines = [engine for engine in upper_engines if engine.has_fuel]
             if not fueled_engines:
@@ -249,7 +290,7 @@ def activate_upper_stage(conn, vessel, state: FlightState):
 
             state.upper_stage_activated = True
             print("Орбитальная ступень Poodle плавно запущена.")
-            return vessel
+            return wait_for_active_vessel(conn)
 
     vessel.control.throttle = 0.0
     raise RuntimeError(
@@ -306,22 +347,48 @@ def circularization_delta_v(vessel) -> float:
     return max(0.0, circular_velocity - velocity_at_apoapsis)
 
 
-def wait_for_upper_stage_thrust(vessel, control, timeout: float = 3.0) -> None:
-    """Запускает Poodle и ждёт появления фактической тяги.
+def wait_for_circularization_thrust(
+    vessel,
+    control,
+    state: FlightState,
+    timeout: float = 3.0,
+) -> None:
+    """Запускает только двигатель реально активной ступени.
 
-    Команда газа и телеметрия тяги приходят в соседних физических кадрах KSP.
-    Поэтому нулевая тяга сразу после открытия газа ещё не означает отказ.
+    Пока центральная ступень не отделена, Poodle принудительно выключен, а
+    циркуляризацию начинает Mainsail. Это не позволяет включить Poodle внутри
+    ещё присоединённой центральной ступени.
     """
-    upper_engines = engines_with_name(vessel, "liquidEngine2-2")
-    if not upper_engines:
-        raise RuntimeError("Орбитальный двигатель Poodle не найден.")
+    if not state.upper_stage_activated:
+        upper_engines = engines_with_name(vessel, "liquidEngine2-2")
+        for engine in upper_engines:
+            if engine.active:
+                engine.active = False
 
-    fueled_engines = [engine for engine in upper_engines if engine.has_fuel]
-    if not fueled_engines:
-        raise RuntimeError("В орбитальной ступени Poodle закончилось топливо.")
+        engines = engines_with_name(vessel, "liquidEngineMainsail")
+        fueled_engines = [engine for engine in engines if engine.has_fuel]
+        engine_name = "Mainsail"
+        if not fueled_engines:
+            control.throttle = 0.0
+            raise RuntimeError(
+                "Mainsail уже пуст, но центральная ступень ещё не отделена. "
+                "Запуск Poodle заблокирован."
+            )
+    else:
+        # После разделения Mainsail вообще не должен принадлежать активному
+        # кораблю. Дополнительная проверка защищает от ошибочного выбора обломка.
+        if engines_with_name(vessel, "liquidEngineMainsail"):
+            control.throttle = 0.0
+            raise RuntimeError(
+                "После отделения активным остался объект с Mainsail; "
+                "запуск Poodle заблокирован."
+            )
+        engines = engines_with_name(vessel, "liquidEngine2-2")
+        fueled_engines = [engine for engine in engines if engine.has_fuel]
+        engine_name = "Poodle"
+        if not fueled_engines:
+            raise RuntimeError("В орбитальной ступени Poodle закончилось топливо.")
 
-    # После длительного участка с закрытым газом KSP иногда оставляет двигатель
-    # выключенным, хотя соответствующая ступень уже была активирована.
     for engine in fueled_engines:
         if not engine.active:
             engine.active = True
@@ -330,28 +397,38 @@ def wait_for_upper_stage_thrust(vessel, control, timeout: float = 3.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if vessel.thrust >= 1.0:
-            print(f"Poodle подтвердил тягу: {vessel.thrust / 1000.0:.1f} кН.")
+            print(
+                f"{engine_name} подтвердил тягу: "
+                f"{vessel.thrust / 1000.0:.1f} кН."
+            )
             return
         time.sleep(0.05)
 
     statuses = ", ".join(
         f"active={engine.active}, has_fuel={engine.has_fuel}"
-        for engine in upper_engines
+        for engine in engines
     )
-    commanded_throttle = control.throttle
     control.throttle = 0.0
     raise RuntimeError(
-        "Poodle не создал тягу за 3 с "
-        f"(команда газа={commanded_throttle:.2f}; {statuses})."
+        f"{engine_name} не создал тягу за {timeout:.0f} с ({statuses})."
     )
 
 
-def execute_node(conn, vessel, node, state: FlightState) -> None:
+def execute_node(conn, vessel, node, state: FlightState):
     control = vessel.control
     autopilot = vessel.auto_pilot
 
     delta_v = abs(node.prograde)
     burn_time = estimate_burn_time(vessel, delta_v)
+    if not state.upper_stage_activated:
+        # Если Mainsail закончится посреди импульса, остаток будет выполнять
+        # менее тяговитый Poodle. Начинаем немного раньше, чтобы не пройти
+        # апоцентр во время безопасного разделения ступеней.
+        upper_engines = engines_with_name(vessel, "liquidEngine2-2")
+        upper_thrust = sum(engine.max_vacuum_thrust for engine in upper_engines)
+        if upper_thrust > 0.0:
+            conservative_time = delta_v * vessel.mass / upper_thrust
+            burn_time = max(burn_time, conservative_time)
     burn_start_ut = node.ut - burn_time / 2.0
 
     print(f"Расчётный импульс: {delta_v:.1f} м/с, время: {burn_time:.1f} с")
@@ -368,7 +445,29 @@ def execute_node(conn, vessel, node, state: FlightState) -> None:
         time.sleep(0.05)
 
     print("Начало циркуляризационного импульса.")
-    wait_for_upper_stage_thrust(vessel, control)
+    if not state.upper_stage_activated:
+        core = engines_with_name(vessel, "liquidEngineMainsail")
+        if core and not any(engine.has_fuel for engine in core):
+            print(
+                "Mainsail закончился перед циркуляризацией — "
+                "сначала отделяю центральную ступень."
+            )
+            vessel = activate_upper_stage(conn, vessel, state)
+            control = vessel.control
+            autopilot = vessel.auto_pilot
+            nodes = list(control.nodes)
+            if len(nodes) != 1:
+                control.throttle = 0.0
+                raise RuntimeError(
+                    "После отделения центральной ступени манёвренный "
+                    f"узел найден неоднозначно: {len(nodes)}."
+                )
+            node = nodes[0]
+            autopilot.reference_frame = node.reference_frame
+            autopilot.target_direction = (0.0, 1.0, 0.0)
+            autopilot.engaged = True
+            autopilot.wait()
+    wait_for_circularization_thrust(vessel, control, state)
     previous_remaining = float("inf")
     increasing_samples = 0
     zero_thrust_since = None
@@ -379,6 +478,11 @@ def execute_node(conn, vessel, node, state: FlightState) -> None:
 
         # Тонкое дросселирование в конце уменьшает перелёт через расчётный импульс.
         control.throttle = clamp(remaining / 25.0, 0.08, 1.0)
+
+        # Если нужный импульс уже набран одновременно с исчерпанием Mainsail,
+        # не отделяем ступень и не запускаем Poodle без необходимости.
+        if remaining < 0.5:
+            break
 
         if vessel.thrust < 1.0:
             if zero_thrust_since is None:
@@ -392,16 +496,33 @@ def execute_node(conn, vessel, node, state: FlightState) -> None:
             core_empty = core and not any(engine.has_fuel for engine in core)
             control.throttle = 0.0
             if core_empty and not state.upper_stage_activated:
-                raise RuntimeError(
-                    "Центральная ступень закончилась во время импульса. "
-                    "Переход на Poodle должен выполняться до создания узла."
+                print(
+                    "Mainsail выработан во время циркуляризации — "
+                    "безопасный переход на Poodle."
                 )
+                vessel = activate_upper_stage(conn, vessel, state)
+                control = vessel.control
+                autopilot = vessel.auto_pilot
+                nodes = list(control.nodes)
+                if len(nodes) != 1:
+                    control.throttle = 0.0
+                    raise RuntimeError(
+                        "После отделения центральной ступени манёвренный "
+                        f"узел найден неоднозначно: {len(nodes)}."
+                    )
+                node = nodes[0]
+                autopilot.reference_frame = node.reference_frame
+                autopilot.target_direction = (0.0, 1.0, 0.0)
+                autopilot.engaged = True
+                autopilot.wait()
+                wait_for_circularization_thrust(vessel, control, state)
+                zero_thrust_since = None
+                previous_remaining = float("inf")
+                increasing_samples = 0
+                continue
             raise RuntimeError("Во время импульса пропала тяга.")
         else:
             zero_thrust_since = None
-
-        if remaining < 0.5:
-            break
 
         if remaining > previous_remaining + 0.15:
             increasing_samples += 1
@@ -419,6 +540,7 @@ def execute_node(conn, vessel, node, state: FlightState) -> None:
     autopilot.engaged = False
     control.sas = True
     print("Циркуляризационный импульс завершён.")
+    return vessel
 
 
 def telemetry_path() -> Path:
@@ -503,7 +625,10 @@ def run() -> None:
         autopilot.engaged = True
         autopilot.wait()
 
-        print("Пуск. Вертикальный участок до 2,5 км.")
+        print(
+            f"Пуск. Вертикальный участок до "
+            f"{VERTICAL_ASCENT_END / 1000.0:.1f} км."
+        )
         control.activate_next_stage()
 
         ascent_apoapsis_target = (
@@ -515,11 +640,20 @@ def run() -> None:
             target_pitch = commanded_pitch(altitude)
             autopilot.target_pitch_and_heading(target_pitch, HEADING)
 
-            if flight.vertical_speed <= 0.0 and altitude > 70_000.0:
+            # Тяжёлая версия может на несколько десятков секунд пройти первый
+            # апоцентр на безопасной высоте около 80 км. Это ещё не авария:
+            # продолжающийся почти горизонтальный импульс быстро поднимает
+            # перицентр и формирует связанную орбиту. Останавливаемся только
+            # при настоящем падении обратно к атмосфере.
+            if (
+                flight.vertical_speed < MAX_SAFE_DESCENT_SPEED
+                and altitude < MIN_SAFE_UPPER_STAGE_ALTITUDE
+                and vessel.orbit.periapsis_altitude < 70_000.0
+            ):
                 control.throttle = 0.0
                 raise RuntimeError(
-                    "Ракета прошла апоцентр до завершения набора высоты. "
-                    "Набор остановлен во избежание узла на следующем витке."
+                    "Орбитальная ступень опасно снижается к атмосфере до "
+                    "формирования безопасного перицентра."
                 )
 
             throttle = atmospheric_throttle(altitude, flight.dynamic_pressure)
@@ -590,7 +724,7 @@ def run() -> None:
         delta_v = circularization_delta_v(vessel)
         node_ut = conn.space_center.ut + vessel.orbit.time_to_apoapsis
         node = control.add_node(node_ut, prograde=delta_v)
-        execute_node(conn, vessel, node, state)
+        vessel = execute_node(conn, vessel, node, state)
 
     periapsis = vessel.orbit.periapsis_altitude
     apoapsis = vessel.orbit.apoapsis_altitude
