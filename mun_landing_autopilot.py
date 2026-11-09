@@ -20,18 +20,19 @@ import krpc
 MIN_ORBIT_ALTITUDE = 15_000.0
 MAX_ORBIT_ALTITUDE = 120_000.0
 MIN_SUN_ELEVATION = 20.0
-MAX_TERRAIN_VARIATION = 90.0
-SITE_SAMPLE_RADIUS_DEG = 0.15
+MAX_TERRAIN_VARIATION = 35.0
+SITE_SAMPLE_RADIUS_DEG = 0.35
 SITE_SEARCH_STEP = 30.0
 SITE_LEAD_TIME = 180.0
 MIN_ELECTRIC_CHARGE = 25.0
 MIN_LANDING_TWR = 1.25
-HORIZONTAL_BRAKE_TARGET = 12.0
+POODLE_BRAKE_TARGET_SPEED = 5.0
+TOUCHDOWN_HORIZONTAL_SPEED = 2.0
 TOUCHDOWN_ALTITUDE = 4.0
 TOUCHDOWN_SPEED = 1.5
 ALIGNMENT_TIMEOUT = 75.0
-DESCENT_BURN_MARGIN = 1.30
-DESCENT_BURN_BUFFER = 250.0
+DESCENT_BURN_MARGIN = 1.12
+DESCENT_BURN_BUFFER = 100.0
 POODLE_SEPARATION_FORCE_PERCENT = 20.0
 POODLE_CLEARANCE_DISTANCE = 5.0
 POODLE_CLEARANCE_TIMEOUT = 8.0
@@ -39,10 +40,6 @@ POODLE_CLEARANCE_TIMEOUT = 8.0
 
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
-
-
-def vector_add(left, right):
-    return tuple(a + b for a, b in zip(left, right))
 
 
 def vector_subtract(left, right):
@@ -126,26 +123,22 @@ def sun_elevation(conn, body, latitude: float, longitude: float) -> float:
     sun = conn.space_center.bodies["Sun"].position(frame)
     normal = normalized(site)
     direction_to_sun = normalized(vector_subtract(sun, site))
-    return math.degrees(math.asin(clamp(vector_dot(normal, direction_to_sun), -1.0, 1.0)))
+    sine = clamp(vector_dot(normal, direction_to_sun), -1.0, 1.0)
+    return math.degrees(math.asin(sine))
 
 
 def terrain_variation(body, latitude: float, longitude: float) -> float:
+    """Измеряет перепад высот на широкой сетке вокруг точки посадки."""
     delta = SITE_SAMPLE_RADIUS_DEG
     heights = []
-    for dlat, dlon in (
-        (0.0, 0.0),
-        (delta, 0.0),
-        (-delta, 0.0),
-        (0.0, delta),
-        (0.0, -delta),
-        (delta, delta),
-        (delta, -delta),
-        (-delta, delta),
-        (-delta, -delta),
-    ):
-        sample_latitude = clamp(latitude + dlat, -89.8, 89.8)
-        sample_longitude = (longitude + dlon + 180.0) % 360.0 - 180.0
-        heights.append(body.surface_height(sample_latitude, sample_longitude))
+    offsets = (-delta, -delta / 2.0, 0.0, delta / 2.0, delta)
+    for dlat in offsets:
+        for dlon in offsets:
+            sample_latitude = clamp(latitude + dlat, -89.8, 89.8)
+            sample_longitude = (longitude + dlon + 180.0) % 360.0 - 180.0
+            heights.append(
+                body.surface_height(sample_latitude, sample_longitude)
+            )
     return max(heights) - min(heights)
 
 
@@ -169,9 +162,17 @@ def find_landing_site(conn, vessel):
         if illumination >= MIN_SUN_ELEVATION:
             variation = terrain_variation(body, latitude, longitude)
             if variation <= MAX_TERRAIN_VARIATION:
-                score = variation - illumination * 2.0
-                candidate = (score, candidate_ut, latitude, longitude, illumination, variation)
-                if best is None or candidate[0] < best[0]:
+                # Сначала выбираем самый ровный участок. Освещённость служит
+                # только вторичным критерием между площадками сходной ровности.
+                candidate = (
+                    variation,
+                    -illumination,
+                    candidate_ut,
+                    latitude,
+                    longitude,
+                    illumination,
+                )
+                if best is None or candidate < best:
                     best = candidate
         candidate_ut += SITE_SEARCH_STEP
 
@@ -180,7 +181,7 @@ def find_landing_site(conn, vessel):
             "На текущем витке не найден достаточно светлый и ровный участок. "
             "Попробуйте запустить скрипт через один виток."
         )
-    _, site_ut, latitude, longitude, illumination, variation = best
+    variation, _, site_ut, latitude, longitude, illumination = best
     return site_ut, latitude, longitude, illumination, variation
 
 
@@ -242,7 +243,8 @@ def brake_with_poodle(vessel, autopilot, frame) -> None:
         vertical_speed, horizontal_speed = point_opposite_velocity(
             vessel, autopilot, frame
         )
-        if horizontal_speed <= HORIZONTAL_BRAKE_TARGET:
+        total_speed = math.hypot(vertical_speed, horizontal_speed)
+        if total_speed <= POODLE_BRAKE_TARGET_SPEED:
             break
         if vessel.thrust < 1.0 and time.monotonic() >= thrust_deadline:
             control.throttle = 0.0
@@ -259,10 +261,12 @@ def brake_with_poodle(vessel, autopilot, frame) -> None:
     # Перед разделением гарантированно глушим двигатель. Иначе остаточная тяга
     # и работа автопилота могут впечатать Poodle в посадочный аппарат.
     engine.active = False
-    _, horizontal_speed = point_opposite_velocity(vessel, autopilot, frame)
+    vertical_speed, horizontal_speed = point_opposite_velocity(
+        vessel, autopilot, frame
+    )
     print(
-        f"Работа Poodle завершена; горизонтальная скорость "
-        f"{horizontal_speed:.1f} м/с."
+        f"Работа Poodle завершена; скорость: горизонтальная "
+        f"{horizontal_speed:.1f} м/с, вертикальная {vertical_speed:.1f} м/с."
     )
 
 
@@ -431,24 +435,6 @@ def safely_separate_poodle(space_center, vessel, separator):
     return vessel
 
 
-def landing_direction(vessel, frame, horizontal_speed: float):
-    position = vessel.position(frame)
-    velocity = vessel.velocity(frame)
-    up = normalized(position)
-    vertical_speed = vector_dot(velocity, up)
-    horizontal = vector_subtract(velocity, vector_scale(up, vertical_speed))
-    if horizontal_speed <= 0.2:
-        return up
-    horizontal_opposite = normalized(vector_scale(horizontal, -1.0))
-    tilt = clamp(horizontal_speed / 45.0, 0.0, 0.45)
-    return normalized(
-        vector_add(
-            vector_scale(up, 1.0 - tilt),
-            vector_scale(horizontal_opposite, tilt),
-        )
-    )
-
-
 def target_descent_speed(radar_altitude: float) -> float:
     if radar_altitude > 15_000.0:
         return -85.0
@@ -606,56 +592,18 @@ def run() -> None:
     autopilot.engaged = True
     wait_for_alignment(vessel, autopilot)
     control.rcs = False
-    print("Начинаю гашение орбитальной скорости.")
-
+    print(
+        "Начинаю совмещённое торможение: горизонтальная и вертикальная "
+        "скорости гасятся одним ретроградным импульсом."
+    )
+    previous_report_altitude = float("inf")
     zero_thrust_since = None
     while True:
         vertical_speed, horizontal_speed = point_opposite_velocity(
             vessel, autopilot, frame
         )
         flight = vessel.flight(body.reference_frame)
-        radar_altitude = flight.surface_altitude
-        control.throttle = 1.0
-        if horizontal_speed <= HORIZONTAL_BRAKE_TARGET:
-            break
-        if vessel.thrust < 1.0:
-            if zero_thrust_since is None:
-                zero_thrust_since = time.monotonic()
-            elif time.monotonic() - zero_thrust_since >= 1.0:
-                control.throttle = 0.0
-                if not any(engine.has_fuel for engine in engines):
-                    raise RuntimeError(
-                        "Посадочные двигатели выработали топливо во время "
-                        "гашения орбитальной скорости."
-                    )
-                raise RuntimeError(
-                    "Посадочные двигатели не создают тягу во время торможения."
-                )
-        else:
-            zero_thrust_since = None
-        if radar_altitude < 6_000.0 and vertical_speed < -90.0:
-            print(
-                "Высота ниже 6 км: перехожу к управляемому снижению с "
-                f"остаточной горизонтальной скоростью {horizontal_speed:.1f} м/с."
-            )
-            break
-        time.sleep(0.05)
-
-    control.throttle = 0.0
-    print(
-        "Перехожу к экономичному снижению: свободное падение до расчётной "
-        "точки торможения."
-    )
-    previous_report_altitude = float("inf")
-    zero_thrust_since = None
-    while True:
-        flight = vessel.flight(body.reference_frame)
         radar_altitude = max(0.0, flight.surface_altitude)
-        vertical_speed = flight.vertical_speed
-        horizontal_speed = flight.horizontal_speed
-        autopilot.target_direction = landing_direction(
-            vessel, frame, horizontal_speed
-        )
 
         target_speed = target_descent_speed(radar_altitude)
         downward_speed = max(0.0, -vertical_speed)
@@ -667,7 +615,9 @@ def run() -> None:
         )
         speed_to_remove_squared = max(
             0.0,
-            downward_speed**2 - target_downward_speed**2,
+            downward_speed**2
+            + horizontal_speed**2
+            - target_downward_speed**2,
         )
         stopping_distance = (
             speed_to_remove_squared / (2.0 * braking_acceleration)
@@ -681,8 +631,12 @@ def run() -> None:
             # Частичная тяга на большой высоте только растягивает торможение и
             # тратит топливо на компенсацию гравитации. Здесь выгоднее падать.
             control.throttle = 0.0
-        elif vertical_speed < target_speed - 2.0:
-            # Короткий мощный импульс заметно экономичнее долгого зависания.
+        elif (
+            vertical_speed < target_speed - 2.0
+            or horizontal_speed > TOUCHDOWN_HORIZONTAL_SPEED
+        ):
+            # Один короткий ретроградный импульс одновременно гасит обе
+            # составляющие скорости. Это дешевле двух отдельных торможений.
             control.throttle = 1.0
         else:
             speed_error = target_speed - vertical_speed
@@ -725,6 +679,7 @@ def run() -> None:
         if landed or (
             radar_altitude <= TOUCHDOWN_ALTITUDE
             and abs(vertical_speed) <= TOUCHDOWN_SPEED
+            and horizontal_speed <= TOUCHDOWN_HORIZONTAL_SPEED
         ):
             break
         if radar_altitude < 25.0 and vertical_speed < -5.0:
